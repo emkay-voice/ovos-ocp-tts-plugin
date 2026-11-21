@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovos-ocp-tts-plugin"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "OCP stream extractor for text read aloud: tts// uris play as sentences spoken in the device's own voice, rendered by ovos-audio"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -21,6 +21,7 @@ dependencies = [
     "ovos-plugin-manager>=0.0.26",
     "ovos-utils>=0.0.38",
     "ovos-bus-client>=0.0.8",
+    "ovos-config>=0.0.12",
 ]
 
 [project.optional-dependencies]

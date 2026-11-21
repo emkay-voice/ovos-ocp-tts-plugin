@@ -12,6 +12,13 @@ One uri is one sentence (or a short paragraph). A reading is a playlist of
 such entries, so the player's own controls do the rest: pause and resume,
 next and previous sentence, and the position is the playlist index.
 
+Rendering ahead: the player asks for one sentence at a time, and only when
+the one before it has ended, so each sentence would wait for its own
+rendering. The extractor therefore listens for the playlist it is about to
+be asked about (``ovos.common_play.play``) and, whenever a sentence is asked
+for, renders the next few in the background. When the player gets there,
+the sentence is ready. Setting ``tts_prefetch`` (default 2; 0 turns it off).
+
 See OpenVoiceOS/ovos-media#240.
 """
 import base64
@@ -40,6 +47,20 @@ RENDERED = ("ovos.audio.speech", "speak:b64_audio.response")
 SESSION_ID = "ovos-ocp-tts-plugin"
 RENDER_TIMEOUT = 60  # seconds; a long sentence on a slow device
 CACHE_MAX_AGE = 24 * 3600  # seconds a rendered file is kept
+PREFETCH = 2  # sentences rendered ahead of the one asked for
+PLAY = "ovos.common_play.play"  # carries the playlist the player will ask about
+
+
+class _Rendering:
+    """One sentence's rendering: asked for, in progress, or done (``path``,
+    None when it failed)."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.path = None
+
+    def usable(self) -> bool:
+        return not self.done.is_set() or bool(self.path and os.path.exists(self.path))
 
 
 def tts_uri(text: str, lang: str) -> str:
@@ -67,11 +88,56 @@ def default_cache_dir() -> Path:
 class OCPTTSExtractor(OCPStreamExtractor):
 
     def __init__(self, ocp_settings=None, bus=None, cache_dir=None):
+        # ovos-plugin-manager makes extractors with no settings; then they
+        # come from the "media" section of mycroft.conf, next to the player's
+        if ocp_settings is None:
+            try:
+                from ovos_config import Configuration
+                ocp_settings = Configuration().get("media", {})
+            except Exception:
+                ocp_settings = {}
         super().__init__(ocp_settings)
         self._bus = bus
         self._bus_lock = threading.Lock()
         self.cache_dir = Path(cache_dir) if cache_dir else default_cache_dir()
         self.timeout = self.ocp_settings.get("tts_render_timeout", RENDER_TIMEOUT)
+        self.prefetch = max(0, int(self.ocp_settings.get("tts_prefetch", PREFETCH)))
+        self._lock = threading.Lock()
+        self._playlist = []   # the tts// uris of the playlist being played, in order
+        self._cursor = 0      # where in it the player last asked
+        self._renderings = {}  # uri -> _Rendering, for the sentences around the cursor
+        if self.prefetch:
+            if bus is not None:
+                self._listen()
+            else:
+                # the play request arrives before the first sentence is asked
+                # for, so listen from the start; connecting must not hold up
+                # the player loading its extractors
+                threading.Thread(target=self._listen, daemon=True,
+                                 name="ovos-ocp-tts-plugin-listen").start()
+
+    def _listen(self):
+        try:
+            self.bus.on(PLAY, self._on_play)
+        except Exception as e:
+            LOG.warning(f"not rendering ahead, no messagebus: {e}")
+
+    def _on_play(self, message):
+        """Remember the tts// uris of a playlist the player is about to play,
+        and start on its first sentences."""
+        data = message.data or {}
+        entries = data.get("playlist") or [data.get("media")]
+        uris = [e["uri"] for e in entries
+                if isinstance(e, dict) and isinstance(e.get("uri"), str) and parse_tts_uri(e["uri"])]
+        if not uris:
+            return
+        start = data.get("media", {}).get("uri") if isinstance(data.get("media"), dict) else None
+        with self._lock:
+            self._playlist = uris
+            self._cursor = uris.index(start) if start in uris else 0
+            self._renderings = {u: r for u, r in self._renderings.items() if u in uris}
+            upcoming = uris[self._cursor:self._cursor + 1 + self.prefetch]
+        self._render_ahead(upcoming)
 
     @classproperty
     def runtime_requirements(cls):
@@ -104,11 +170,64 @@ class OCPTTSExtractor(OCPStreamExtractor):
         parsed = parse_tts_uri(uri)
         if not parsed:
             return None
-        lang, text = parsed
-        path = self.render(text, lang)
-        if not path:
+        rendering, mine = self._claim(uri)
+        if mine:
+            self._finish(uri, rendering)
+        else:
+            rendering.done.wait(self.timeout)  # rendered ahead, or still being
+        self._render_ahead(self._upcoming(uri))
+        if not rendering.path:
             return None
-        return {"uri": f"file://{path}"}
+        return {"uri": f"file://{rendering.path}"}
+
+    # --- rendering ahead -------------------------------------------------------------
+
+    def _claim(self, uri):
+        """The rendering of ``uri``: one already done or under way, or a new
+        one this caller has to do (``mine``)."""
+        with self._lock:
+            rendering = self._renderings.get(uri)
+            if rendering is not None and rendering.usable():
+                return rendering, False
+            rendering = self._renderings[uri] = _Rendering()
+            return rendering, True
+
+    def _finish(self, uri, rendering):
+        try:
+            rendering.path = self.render(*parse_tts_uri(uri)[::-1])
+        finally:
+            rendering.done.set()
+            if not rendering.path:
+                with self._lock:  # a failed one is tried again when asked for
+                    if self._renderings.get(uri) is rendering:
+                        del self._renderings[uri]
+
+    def _upcoming(self, uri):
+        """The sentences after ``uri`` in the playlist being played; also
+        moves the cursor there and forgets renderings left behind."""
+        with self._lock:
+            if uri not in self._playlist:
+                # not from a playlist it heard about: nothing to look ahead to
+                self._renderings = {u: r for u, r in self._renderings.items() if u == uri}
+                return []
+            # a sentence can occur twice: take the one nearest the cursor
+            hits = [i for i, u in enumerate(self._playlist) if u == uri]
+            self._cursor = min(hits, key=lambda i: abs(i - self._cursor))
+            keep = set(self._playlist[max(0, self._cursor - 1):self._cursor + 1 + self.prefetch])
+            self._renderings = {u: r for u, r in self._renderings.items() if u in keep}
+            return self._playlist[self._cursor + 1:self._cursor + 1 + self.prefetch]
+
+    def _render_ahead(self, uris):
+        """Render ``uris`` in order on a background thread, skipping any
+        already done or under way."""
+        todo = []
+        for uri in uris:
+            rendering, mine = self._claim(uri)
+            if mine:
+                todo.append((uri, rendering))
+        if todo:
+            threading.Thread(target=lambda: [self._finish(u, r) for u, r in todo],
+                             daemon=True, name="ovos-ocp-tts-plugin-ahead").start()
 
     def render(self, text: str, lang: str) -> Optional[str]:
         """Ask ovos-audio for ``text`` spoken in ``lang``; the cache file's

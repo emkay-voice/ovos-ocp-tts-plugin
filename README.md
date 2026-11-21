@@ -53,11 +53,24 @@ pip install ovos-ocp-tts-plugin
 It is picked up by every player that uses OVOS' stream extractors (`opm.ocp.extractor`), such as ovos-media. ovos-audio
 must be running, as it always is on an OVOS device.
 
+## Rendering ahead
+
+The player asks for one sentence at a time, only when the one before it has ended, so each sentence would wait for
+its own rendering. The extractor listens for the playlist (`ovos.common_play.play`) and, whenever a sentence is asked
+for, renders the next few in the background, one at a time. When the player gets there, the sentence is ready, and
+going back a sentence needs no new rendering either.
+
 ## Configuration
 
-None needed. Under the player's OCP settings, `tts_render_timeout` (seconds, default 60) is how long to wait for
-ovos-audio to render a sentence. Rendered files are kept in `~/.cache/ovos-ocp-tts-plugin` for a day; ovos-audio's own
-TTS cache is what makes a repeated sentence fast.
+None needed. In the `media` section of `mycroft.conf`, next to the player's own settings:
+
+| key | default | what it does |
+|---|---|---|
+| `tts_prefetch` | `2` | sentences rendered ahead of the one being played; `0` turns it off |
+| `tts_render_timeout` | `60` | seconds to wait for ovos-audio to render a sentence |
+
+Rendered files are kept in `~/.cache/ovos-ocp-tts-plugin` for a day; ovos-audio's own TTS cache is what makes a
+repeated sentence fast.
 
 ## Development
 
