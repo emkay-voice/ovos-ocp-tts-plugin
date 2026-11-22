@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovos-ocp-tts-plugin"
-version = "0.1.0a2"
+version = "0.1.0a3"
 description = "OCP stream extractor for text read aloud: tts// uris play as sentences spoken in the device's own voice, rendered by ovos-audio"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [{name = "emkay-voice"}]
+maintainers = [{name = "Andreas Lorensen"}]
 requires-python = ">=3.10"
 keywords = ["ovos", "openvoiceos", "plugin", "ocp", "stream-extractor", "tts", "reading", "ovos-media", "emkay"]
 classifiers = [
